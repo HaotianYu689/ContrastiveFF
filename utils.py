@@ -18,6 +18,8 @@ def parse_option():
     parser = argparse.ArgumentParser('argument for training')
 
     parser.add_argument('--data', type=str, default='cifar10',choices=['cifar10', 'cifar100','tiny_imagenet'], help='set data')
+    parser.add_argument('--data_folder', type=str, default='./data/',help='路径到 CIFAR-10 批次文件所在目录')
+
     parser.add_argument('--model', type=str, default='vit',choices=['vit', 'swin'], help='set model')
     parser.add_argument('--batch_size', type=int, default=512, help='batch_size')
     parser.add_argument('--epochs1', type=int, default=600, help='number of training epochs')
@@ -48,7 +50,7 @@ def parse_option():
 
     # set the path according to the environment
 
-    args.data_folder = './data/'
+    #args.data_folder = './data/'
     args.model_path = './save/SupCon/{}_models'.format(args.data)
 
     args.model_name = 'CFF_{}_ViT_[{} {} {}]_lr_{}_bsz_{}_temp_{}_m0{}'.\
@@ -144,8 +146,13 @@ def set_loaders(args):
         test_transform = transforms.Compose([v2.ToDtype(torch.float32, scale=True),
                                             v2.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010))])
         #v2.Resize((224,224))
-        train_dataset = datasets.CIFAR10('./data/',train=True,transform=transforms.Compose([v2.ToImage()]),download=True)
-        test_dataset  = datasets.CIFAR10('./data/',train=False,transform=transforms.Compose([v2.ToImage()]),download=True)
+        #train_dataset = datasets.CIFAR10('./data/',train=True,transform=transforms.Compose([v2.ToImage()]),download=True)
+        #Test_dataset  = datasets.CIFAR10('./data/',train=False,transform=transforms.Compose([v2.ToImage()]),download=True)
+
+
+        train_dataset = datasets.CIFAR10(args.data_folder,train=True,transform=transforms.Compose([v2.ToImage()]),download=False)
+        test_dataset  = datasets.CIFAR10(args.data_folder,train=False,transform=transforms.Compose([v2.ToImage()]),download=False)
+
 
         args.patch_size  = 4
         args.num_patches = int((32**2) / (args.patch_size**2))

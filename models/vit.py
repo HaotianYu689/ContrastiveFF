@@ -1,134 +1,110 @@
-import os
-import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import matplotlib.pyplot as plt
 
+# ---------- Patchify 工具 ----------
 def img_to_patch(x, patch_size):
-    '''Transforms image into list of patches of the specified dimensions
-    Args:
-        x (Tensor): Tensor of dimensions B x C x H x W, representing a batch.
-        B=Batch size, C=Channel count.
-        patch_size (int): Size of one side of (square) patch.
-    Returns:
-        patch_seq (Tensor): List of patches of dimension B x N x [C * P ** 2],
-        where N is the number of patches and P is patch_size.
-    '''
+    """B,3,H,W → B,N,(3*P*P)"""
     B, C, H, W = x.shape
+    assert H % patch_size == 0 and W % patch_size == 0, "Image dim not divisible by patch size"
+    x = x.reshape(B, C,
+                  H // patch_size, patch_size,
+                  W // patch_size, patch_size)          # B,C,Hc,P,Wc,P
+    x = x.permute(0, 2, 4, 1, 3, 5).flatten(1, 2)        # B,N,C,P,P
+    x = x.flatten(2, 4)                                  # B,N,3*P*P
+    return x                                             # N = (H/P)*(W/P)
 
-    # reshape to B x C x H_count x H_patch x W_count x W_patch
-    x = x.reshape(B, C, H // patch_size, patch_size, W // patch_size, patch_size)
-    x = x.permute(0, 2, 4, 1, 3, 5)
-    x = x.flatten(1, 2)
-    x = x.flatten(2, 4)
-
-    return x
-
+# ---------- 子模块 ----------
 class PatchingLayer(nn.Module):
-    
-    def __init__(self,opt):
+    """把 B×3×32×32 → B×N×patch_dim，并可选拼接 class token"""
+    def __init__(self, opt):
         super().__init__()
-        self.patch_size = opt.patch_size
-        self.num_class  = opt.num_class
-        self.flag = True
-        
-    def set_label_rep(self,x):
-        self.labels  = torch.zeros(self.num_class,1,self.patch_size * self.patch_size*3).cuda()
+        self.P = opt.patch_size
+        self.num_class = opt.num_class
+        self.label_bank = None
+
+    def set_label_rep(self, x):
+        """随机初始化 class token，维度与 patch 吻合"""
+        patch_dim = x.size(-1)
+        bank = torch.zeros(self.num_class, 1, patch_dim, device=x.device)
         for c in range(self.num_class):
-            indices = torch.randperm(int(self.labels.shape[2]))
-            self.labels[c,:,indices[int(len(indices)*0.2)]] = x.max()
-            self.flag = False
+            idx = torch.randint(0, patch_dim, (int(patch_dim*0.2),))
+            bank[c, 0, idx] = x.max()
+        self.label_bank = bank     # num_class ×1×patch_dim
 
     def forward(self, x, y=None):
-
-        B, C, H, W = x.shape
-
-        # reshape to B x C x H_count x H_patch x W_count x W_patch
-        x = x.reshape(B, C, H // self.patch_size, self.patch_size, W // self.patch_size, self.patch_size)
-        x = x.permute(0, 2, 4, 1, 3, 5)
-        x = x.flatten(1,2)
-        x = x.flatten(2, 4)
- 
-        if y!=None:
-            if self.flag: self.set_label_rep(x)
-            x = torch.cat([self.labels[y], x], dim=1)
-        return x
-    
+        x = img_to_patch(x, self.P)           # B,N,patch_dim
+        if y is not None:
+            if self.label_bank is None:
+                self.set_label_rep(x)
+            cls_tok = self.label_bank[y]      # B,1,patch_dim
+            x = torch.cat([cls_tok, x], dim=1)
+        return x                              # B , N(+1) , patch_dim
 
 class PositionalEncoder(nn.Module):
-    
-    def __init__(self,opt):
+    def __init__(self, opt):
         super().__init__()
-        # Learnable parameters for position embedding
-        self.pos_embed   = nn.Parameter(torch.randn((1, opt.num_patches, opt.E)))
-
-
+        self.pos = nn.Parameter(torch.randn(1, opt.num_patches, opt.E))
     def forward(self, x):
-        return x + self.pos_embed
+        return x + self.pos[:, :x.size(1)]     # 兼容是否加了 cls token
 
 class ViTEncoder(nn.Module):
-    def __init__(self, input_dim, hidden_dim, num_heads, dropout=0.0):
+    def __init__(self, E, hidden_dim, num_heads, dropout=0.0):
         super().__init__()
-        self.norm1 = nn.LayerNorm(input_dim)
-        self.attn  = nn.MultiheadAttention(input_dim, num_heads, batch_first=True)
-        self.norm2 = nn.LayerNorm(input_dim)
-        self.fc1   = nn.Linear(input_dim, hidden_dim)
-        self.act   = nn.GELU()
-        self.fc2   = nn.Linear(hidden_dim, input_dim)
-        self.drop1 = nn.Dropout(dropout)
-        self.drop2 = nn.Dropout(dropout)
-
+        self.norm1 = nn.LayerNorm(E)
+        self.attn  = nn.MultiheadAttention(E, num_heads, batch_first=True)
+        self.norm2 = nn.LayerNorm(E)
+        self.mlp   = nn.Sequential(
+            nn.Linear(E, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, E),
+            nn.Dropout(dropout)
+        )
     def forward(self, x):
-        out = self.norm1(x)
-        out, _ = self.attn(out, out, out)
+        h = self.attn(self.norm1(x), self.norm1(x), self.norm1(x))[0]
+        x = x + h                          # residual 1
+        x = x + self.mlp(self.norm2(x))    # residual 2
+        return x
 
-        # First residual connection
-        resid = x + out
-
-        # Pass through MLP layer
-        out = self.norm2(resid)
-        out = self.act(self.fc1(out))
-        out = self.drop1(out)
-        out = self.fc2(out)
-        out = self.drop2(out)
-
-        # Second residual connection
-        out = out + resid
-
-        return out
-
-
+# ---------- ViT 主体 ----------
 class ViT(nn.Module):
     def __init__(self, opt):
         super().__init__()
 
+        self.patch_dim = 3 * (opt.patch_size ** 2)    # 48 (when P=4)
+        self.E         = opt.E
+
         self.patching_layer = PatchingLayer(opt)
-        self.layers = nn.ModuleList()
 
-        # First layer
-        self.layers.append(nn.Sequential(
-          nn.Linear(3*(opt.patch_size**2), opt.E),
-          nn.ReLU(),
-          PositionalEncoder(opt),
-          ViTEncoder(opt.E, opt.E*2, opt.H)
-        ))
-        
-        # Another layers
-        self.layers.extend([ViTEncoder(opt.E, opt.E*2, opt.H) for _ in range(1,opt.L)])
-            
-        # Classification head
-        self.classifier_head = nn.Sequential(nn.LayerNorm(opt.E),
-                                             nn.Linear(opt.E, opt.num_class))
+        # 第一块：patch → embedding
+        first_block = nn.Sequential(
+            nn.Linear(self.patch_dim, self.E),
+            nn.ReLU(),
+            PositionalEncoder(opt),
+            ViTEncoder(self.E, self.E*2, opt.H)
+        )
 
-    def forward(self, x):
-        # Encoding
-        for layer in self.layers:
-            x = layer(x)
-        
-        # AVG pooling
-        x = x.mean(1)
+        # 后续 Transformer blocks
+        other_blocks = [ViTEncoder(self.E, self.E*2, opt.H) for _ in range(1, opt.L)]
 
-        # Pass through classification head
-        x = self.classifier_head(x)
-        return x
+        self.layers = nn.ModuleList([first_block] + other_blocks)
+
+        # classification head
+        self.head = nn.Sequential(
+            nn.LayerNorm(self.E),
+            nn.Linear(self.E, opt.num_class)
+        )
+
+    def forward(self, x, y=None):
+        # --------- 调试输出 ---------
+        # print("x0 :", x.shape)    # e.g. (B,3,32,32)
+        # ---------------------------
+
+        x = self.patching_layer(x, y)       # B,N,patch_dim
+        for block in self.layers:
+            x = block(x)                    # B,N,E
+
+        x = x.mean(1)                       # global average
+        return self.head(x)                 # B,num_class
+
